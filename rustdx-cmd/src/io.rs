@@ -11,6 +11,9 @@ use std::{
     path::Path,
     process::Command,
 };
+use crate::cmd::GbbqCmd;
+use rustdx::file::gbbq::Gbbqs;
+use chrono::NaiveDate;
 
 const BUFFER_SIZE: usize = 32 * (1 << 20); // 32M
 
@@ -268,12 +271,12 @@ pub fn previous_csv(p: impl AsRef<Path>, keep_factor: bool) -> Previous {
 fn clickhouse_factor_csv(table: &str, keep_factor: bool) -> Previous {
     let query = format!(
         "\
-WITH 
+WITH
   df AS (
   SELECT
     code,
   arrayLast(
-      x->true, 
+      x->true,
       arraySort(x->x.1, groupArray((
         date, close, factor
       )))
@@ -351,5 +354,204 @@ pub fn read_xlsx(path: &str, col: usize, prefix: &str) -> Option<StockList> {
         )
     } else {
         None
+    }
+}
+
+// Custom struct for GBBQ CSV output
+#[derive(Debug, serde::Serialize)]
+struct GbbqCsvRecord {
+    market: String,
+    code: String,
+    date: String,
+    category: u8,
+    category_name: String,
+    fh_qltp: f32,
+    pgj_qzgb: f32,
+    sg_hltp: f32,
+    pg_hzgb: f32,
+}
+
+impl GbbqCsvRecord {
+    fn from_gbbq(gbbq: &Gbbq) -> Self {
+        Self {
+            market: match gbbq.market {
+                1 => "SZ".to_string(),
+                2 => "SH".to_string(),
+                _ => gbbq.market.to_string(),
+            },
+            code: gbbq.code.to_string(),
+            date: format_gbbq_date(gbbq.date),
+            category: gbbq.category,
+            category_name: get_gbbq_category_name(gbbq.category),
+            fh_qltp: gbbq.fh_qltp,
+            pgj_qzgb: gbbq.pgj_qzgb,
+            sg_hltp: gbbq.sg_hltp,
+            pg_hzgb: gbbq.pg_hzgb,
+        }
+    }
+}
+
+/// Parse and export GBBQ data to CSV
+pub fn run_gbbq_csv(cmd: &GbbqCmd) -> Result<()> {
+    info!("🚀 Starting GBBQ file parsing...");
+
+    // Check if file exists
+    if !cmd.gbbq_file.exists() {
+        return Err(anyhow!("GBBQ file not found: {:?}", cmd.gbbq_file));
+    }
+
+    // Load and parse GBBQ file
+    info!("📁 Loading GBBQ file: {:?}", cmd.gbbq_file);
+    let mut gbbqs = Gbbqs::from_file(&cmd.gbbq_file)?;
+    info!("📊 Found {} records in the file", gbbqs.count);
+
+    // Parse all records
+    info!("🔓 Decrypting and parsing records...");
+    let gbbq_records = gbbqs.to_vec();
+    info!("✅ Successfully parsed {} records", gbbq_records.len());
+
+    // Apply filters
+    let filtered_records = apply_gbbq_filters(&gbbq_records, cmd);
+    info!("🔍 After filtering: {} records", filtered_records.len());
+
+    // Create CSV writer
+    info!("📝 Creating CSV file: {}", cmd.output);
+    let file = File::create(&cmd.output)?;
+    let mut wtr = csv::WriterBuilder::new()
+        .buffer_capacity(BUFFER_SIZE)
+        .from_writer(file);
+
+    // Write records to CSV
+    let mut written_count = 0;
+    let mut category_stats = std::collections::HashMap::new();
+
+    for record in &filtered_records {
+        let csv_record = GbbqCsvRecord::from_gbbq(record);
+        wtr.serialize(&csv_record)?;
+        written_count += 1;
+
+        // Collect statistics
+        *category_stats.entry(record.category).or_insert(0) += 1;
+
+        // Progress indicator for large files
+        if written_count % 1000 == 0 {
+            info!("📝 Written {} records...", written_count);
+        }
+    }
+
+    wtr.flush()?;
+
+    // Display results
+    info!("🎉 Success! GBBQ data saved to: {}", cmd.output);
+    info!("📈 Total records written: {}", written_count);
+
+    // Display category statistics
+    if !category_stats.is_empty() {
+        info!("📊 Records by category:");
+        let mut sorted_categories: Vec<_> = category_stats.iter().collect();
+        sorted_categories.sort_by_key(|(category, _)| *category);
+
+        for (category, count) in sorted_categories {
+            info!("  Category {}: {} records - {}",
+                  category, count, get_gbbq_category_name(*category));
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply filters based on command options
+fn apply_gbbq_filters<'a>(records: &'a [Gbbq], cmd: &GbbqCmd) -> Vec<&'a Gbbq<'a>> {
+    records.iter()
+        .filter(|record| {
+            // Filter by category
+            if let Some(category) = cmd.category {
+                if record.category != category {
+                    return false;
+                }
+            }
+
+            // Filter by stock codes
+            if let Some(stocks) = cmd.parse_stocks() {
+                if !stocks.contains(&record.code.to_string()) {
+                    return false;
+                }
+            }
+
+            // Filter by date range
+            if let Some((start_date, end_date)) = cmd.parse_date_range() {
+                if record.date < start_date || record.date > end_date {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect()
+}
+
+/// Setup ClickHouse table for GBBQ data
+pub fn setup_gbbq_clickhouse(table: &str) -> Result<()> {
+    let create_database = format!("CREATE DATABASE IF NOT EXISTS {}", database_table(table).0);
+    let output = Command::new("clickhouse-client")
+        .args(["--query", &create_database])
+        .output()?;
+    check_output(output);
+
+    let create_table = format!(
+        "CREATE TABLE IF NOT EXISTS {table}
+        (
+            `market` String,
+            `code` FixedString(6),
+            `date` Date,
+            `category` UInt8,
+            `category_name` String,
+            `fh_qltp` Float32,
+            `pgj_qzgb` Float32,
+            `sg_hltp` Float32,
+            `pg_hzgb` Float32
+        )
+        ENGINE = ReplacingMergeTree()
+        ORDER BY (date, code, category)"
+    );
+
+    let output = Command::new("clickhouse-client")
+        .args(["--query", &create_table])
+        .output()?;
+    check_output(output);
+    Ok(())
+}
+
+/// Convert YYYYMMDD integer to YYYY-MM-DD string
+fn format_gbbq_date(date: u32) -> String {
+    let year = date / 10000;
+    let month = (date % 10000) / 100;
+    let day = date % 100;
+
+    if let Some(naive_date) = NaiveDate::from_ymd_opt(year as i32, month, day) {
+        naive_date.format("%Y-%m-%d").to_string()
+    } else {
+        format!("{:04}-{:02}-{:02}", year, month, day)
+    }
+}
+
+/// Get human-readable category name
+fn get_gbbq_category_name(category: u8) -> String {
+    match category {
+        1 => "除权除息".to_string(),
+        2 => "送配股上市".to_string(),
+        3 => "非流通股上市".to_string(),
+        4 => "未知股本变动".to_string(),
+        5 => "股本变化".to_string(),
+        6 => "增发新股".to_string(),
+        7 => "股份回购".to_string(),
+        8 => "增发新股上市".to_string(),
+        9 => "转配股上市".to_string(),
+        10 => "可转债上市".to_string(),
+        11 => "扩缩股".to_string(),
+        12 => "非流通股缩股".to_string(),
+        13 => "送认购权证".to_string(),
+        14 => "送认沽权证".to_string(),
+        _ => format!("Unknown Category ({})", category),
     }
 }

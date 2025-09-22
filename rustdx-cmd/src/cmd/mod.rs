@@ -3,10 +3,12 @@ use eyre::Result;
 
 mod day;
 mod east;
+mod gbbq;
 
 pub use self::{
     day::{auto_prefix, DayCmd},
     east::EastCmd,
+    gbbq::GbbqCmd,
 };
 
 const VERSION: &str = env!("RUSTDX_VERSION");
@@ -24,6 +26,7 @@ enum SubCommand {
     Day(DayCmd),
     EastMoney(EastCmd),
     Help(Show),
+    Gbbq(GbbqCmd),
 }
 
 /// rustdx 版本号、调试
@@ -45,6 +48,7 @@ impl TopLevel {
         match &self.sub {
             Day(cmd) => cmd.help_info().run(),
             EastMoney(cmd) => cmd.run(),
+            Gbbq(cmd) => cmd.run(),
             Help(help) => {
                 if help.version {
                     println!("当前版本号：{VERSION}");
