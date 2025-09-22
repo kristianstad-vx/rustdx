@@ -48,7 +48,7 @@ impl TopLevel {
         match &self.sub {
             Day(cmd) => cmd.help_info().run(),
             EastMoney(cmd) => cmd.run(),
-            Gbbq(cmd) => cmd.run(),
+            Gbbq(cmd) => cmd.help_info().run(),
             Help(help) => {
                 if help.version {
                     println!("当前版本号：{VERSION}");
